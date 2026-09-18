@@ -27,6 +27,12 @@
         ]
       },
       {
+        "group": "Learning",
+        "pages": [
+          "learning/kafka-fundamentals"
+        ]
+      },
+      {
         "group": "Build Log",
         "pages": [
           "setup/01-databases",
@@ -57,7 +63,12 @@
     ]
   },
   "contextual": {
-    "options": ["copy", "view", "claude", "chatgpt"]
+    "options": [
+      "copy",
+      "view",
+      "claude",
+      "chatgpt"
+    ]
   },
   "footer": {
     "socials": {
