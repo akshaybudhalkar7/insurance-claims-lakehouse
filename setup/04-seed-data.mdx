@@ -1,0 +1,95 @@
+---
+title: "4. Seeding the Data"
+description: "Generating a realistic book of business before the connectors start."
+icon: "seedling"
+---
+
+## Why seed before starting Debezium
+
+Debezium's first action on a new connector is a **snapshot** of everything already in the tables, emitted as `op: "r"` events, after which it switches to streaming live changes.
+
+Seeding first means that history flows through the snapshot path exactly as real historical data would. Seeding afterwards would make 160,000 rows arrive as live inserts, which is not what the pipeline will look like in practice.
+
+<Warning>
+Run `seed.py` **once**, before registering any connector.
+</Warning>
+
+## Running it
+
+```powershell
+cd D:\claims-platform
+python generator\seed.py
+```
+
+<Note>
+If `pip` is blocked by an Application Control policy on your machine, install packages with `python -m pip install psycopg2-binary faker` instead.
+</Note>
+
+Two volume settings are available:
+
+```python generator/seed.py
+VOLUMES = {
+    "dev":  {"policyholders": 5_000,   "claims": 12_000},
+    "full": {"policyholders": 400_000, "claims": 900_000},
+}
+```
+
+`python generator\seed.py` gives the dev volume in about ten seconds. `--full` produces roughly 25 million rows for volume testing, and takes several minutes.
+
+## What it produced
+
+| Database | Table | Rows |
+| --- | --- | --- |
+| `policy_admin` | policyholders | 5,000 |
+| `policy_admin` | policies | 6,490 |
+| `policy_admin` | coverages | 18,162 |
+| `claims` | claims | 12,000 |
+| `claims` | status history | 51,405 |
+| `claims` | transactions | 69,901 |
+
+## The realism built into it
+
+<AccordionGroup>
+  <Accordion title="Deliberately broken references" icon="link-slash">
+    ```python
+    ORPHAN_RATE = 0.02
+    ```
+
+    2% of claims carry a `policy_number` that does not exist in `policy_admin`. This gives the dbt relationship tests something genuine to catch, and forces a real decision about what to do with unmatched claims rather than assuming the data is clean.
+  </Accordion>
+
+  <Accordion title="A shared catastrophe event" icon="cloud-bolt">
+    ```python
+    CAT_CODE = "HAIL-2026-08-PUN"
+    CAT_WINDOW = (date(2026, 8, 11), date(2026, 8, 13))
+    ```
+
+    Many claims share one catastrophe code within a three-day window. This is how insurers measure exposure to a single event, and it produces the spiky, clustered data that makes aggregate queries interesting instead of uniformly random.
+  </Accordion>
+
+  <Accordion title="A financially coherent ledger" icon="money-bill-transfer">
+    Transactions follow the actual lifecycle of a claim:
+
+    - a `RESERVE` is set when the claim opens, split into indemnity and expense
+    - the reserve is revised as the claim develops
+    - `PAYMENT` rows appear only for `SETTLED` and `CLOSED` claims
+    - around 12% of claims have a negative `RECOVERY`
+    - rejected claims have their reserve reversed
+
+    Random amounts would let a wrong transformation still look plausible. A coherent ledger means loss-ratio calculations either reconcile or clearly do not.
+  </Accordion>
+
+  <Accordion title="Reproducibility" icon="dice">
+    ```python
+    random.seed(42)
+    fake = Faker("en_IN")
+    Faker.seed(42)
+    ```
+
+    Fixed seeds mean the same data every run, so results can be compared across rebuilds. `Faker("en_IN")` produces Indian names, cities and phone formats, which suits the scenario.
+  </Accordion>
+</AccordionGroup>
+
+<Check>
+Verify the seed landed before moving on — the queries are in [Verification](/reference/verification).
+</Check>

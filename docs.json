@@ -1,37 +1,48 @@
 {
   "$schema": "https://mintlify.com/docs.json",
   "theme": "mint",
-  "name": "Mintlify Starter Kit",
+  "name": "Insurance Claims Lakehouse",
+  "description": "An insurance claims and policy analytics platform built on Postgres CDC, Kafka, S3, Snowflake and dbt.",
   "colors": {
-    "primary": "#16A34A",
-    "light": "#07C983",
-    "dark": "#15803D"
+    "primary": "#0F766E",
+    "light": "#5EEAD4",
+    "dark": "#134E4A"
   },
   "favicon": "/favicon.svg",
   "navigation": {
     "pages": [
       {
-        "group": "Getting Started",
+        "group": "Overview",
         "pages": [
           "index",
-          "quickstart"
+          "architecture"
+        ]
+      },
+      {
+        "group": "Concepts",
+        "pages": [
+          "concepts/change-data-capture",
+          "concepts/wal-and-slots",
+          "concepts/replica-identity"
+        ]
+      },
+      {
+        "group": "Build Log",
+        "pages": [
+          "setup/01-databases",
+          "setup/02-schemas",
+          "setup/03-cdc-enablement",
+          "setup/04-seed-data"
+        ]
+      },
+      {
+        "group": "Reference",
+        "pages": [
+          "reference/verification",
+          "reference/troubleshooting"
         ]
       }
-    ],
-    "global": {
-      "anchors": [
-        {
-          "anchor": "Documentation",
-          "href": "https://mintlify.com/docs",
-          "icon": "book-open-cover"
-        },
-        {
-          "anchor": "Blog",
-          "href": "https://mintlify.com/blog",
-          "icon": "newspaper"
-        }
-      ]
-    }
+    ]
   },
   "logo": {
     "light": "/logo/light.svg",
@@ -40,33 +51,18 @@
   "navbar": {
     "links": [
       {
-        "label": "Support",
-        "href": "mailto:hi@mintlify.com"
+        "label": "GitHub",
+        "href": "https://github.com/akshaybudhalkar7/insurance-claims-lakehouse"
       }
-    ],
-    "primary": {
-      "type": "button",
-      "label": "Dashboard",
-      "href": "https://app.mintlify.com"
-    }
+    ]
   },
   "contextual": {
-    "options": [
-      "copy",
-      "view",
-      "chatgpt",
-      "claude",
-      "perplexity",
-      "mcp",
-      "cursor",
-      "vscode"
-    ]
+    "options": ["copy", "view", "claude", "chatgpt"]
   },
   "footer": {
     "socials": {
-      "x": "https://x.com/mintlify",
-      "github": "https://github.com/mintlify",
-      "linkedin": "https://linkedin.com/company/mintlify"
+      "github": "https://github.com/akshaybudhalkar7",
+      "linkedin": "https://linkedin.com/in/akshay-budhalkar-684a40136"
     }
   }
 }

@@ -1,0 +1,118 @@
+---
+title: "Verification"
+description: "Every check that confirms the current stage is correctly set up."
+icon: "clipboard-check"
+---
+
+Run these in pgAdmin, or with `docker compose exec`. Both databases should pass the same checks.
+
+## Containers
+
+```powershell
+cd D:\claims-platform\Infra
+docker compose ps
+```
+
+Every service should show `running` and, where a healthcheck is defined, `healthy`.
+
+## Logical replication is on
+
+```sql
+SHOW wal_level;
+```
+
+<Check>Must return `logical`. Anything else means the `command:` block in Compose is not taking effect.</Check>
+
+## The publication exists and lists the right tables
+
+```sql
+SELECT pubname FROM pg_publication;
+SELECT schemaname, tablename FROM pg_publication_tables ORDER BY tablename;
+```
+
+<Check>
+`policy_admin` → `dbz_policy_admin` with `policyholder`, `policy`, `policy_coverage`, `endorsement`.
+
+`claims` → `dbz_claims` with `claim`, `claim_status_history`, `claim_transaction`, `adjuster`.
+</Check>
+
+## Replica identity is set as intended
+
+```sql
+SELECT relname,
+       CASE relreplident
+         WHEN 'd' THEN 'DEFAULT'
+         WHEN 'f' THEN 'FULL'
+         WHEN 'n' THEN 'NOTHING'
+         WHEN 'i' THEN 'INDEX'
+       END AS replica_identity
+FROM pg_class
+WHERE relkind = 'r' AND relnamespace = 'public'::regnamespace
+ORDER BY relname;
+```
+
+<Check>Mutating tables `FULL`; append-only tables `DEFAULT`.</Check>
+
+## The Debezium role exists with replication rights
+
+```sql
+SELECT rolname, rolreplication, rolcanlogin
+FROM pg_roles
+WHERE rolname = 'dbz';
+```
+
+<Check>`rolreplication` and `rolcanlogin` both `true`.</Check>
+
+## No replication slots yet
+
+```sql
+SELECT slot_name, plugin, active, restart_lsn FROM pg_replication_slots;
+```
+
+<Check>
+Zero rows is the **correct** result at this stage. Debezium creates the slot when the connector is registered.
+
+If a slot named `manual_peek` or `test_slot` is listed, it is left over from manual testing — drop it, see [Troubleshooting](/reference/troubleshooting).
+</Check>
+
+## Seed data landed
+
+<CodeGroup>
+```sql policy_admin
+SELECT
+  (SELECT count(*) FROM policyholder)    AS policyholders,
+  (SELECT count(*) FROM policy)          AS policies,
+  (SELECT count(*) FROM policy_coverage) AS coverages;
+```
+
+```sql claims
+SELECT
+  (SELECT count(*) FROM claim)                AS claims,
+  (SELECT count(*) FROM claim_status_history) AS status_history,
+  (SELECT count(*) FROM claim_transaction)    AS transactions;
+```
+</CodeGroup>
+
+Expected at dev volume: 5,000 / 6,490 / 18,162 and 12,000 / 51,405 / 69,901.
+
+## The deliberate data quality problems are present
+
+```sql
+-- Claims per catastrophe event
+SELECT catastrophe_code, count(*)
+FROM claim
+WHERE catastrophe_code IS NOT NULL
+GROUP BY 1;
+
+-- Financial ledger by type
+SELECT txn_type, txn_category, count(*), sum(amount)
+FROM claim_transaction
+GROUP BY 1, 2
+ORDER BY 1, 2;
+```
+
+<Check>
+`HAIL-2026-08-PUN` should carry a visible cluster of claims, and `RECOVERY` rows should sum to a negative amount. Both are intentional.
+</Check>
+
+The orphaned claims cannot be checked with a single query, because the two tables live in different databases — which is precisely the point. That check becomes a dbt relationship test once both sides are in Snowflake.

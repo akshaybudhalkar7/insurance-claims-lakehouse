@@ -1,0 +1,111 @@
+---
+title: "Change Data Capture"
+description: "The one idea the rest of the platform depends on."
+icon: "arrows-rotate"
+---
+
+## The problem CDC solves
+
+You need the data from an operational database in your warehouse. The obvious approach is to query it on a schedule:
+
+```sql
+SELECT * FROM claim WHERE updated_at > '2026-09-18 02:00:00';
+```
+
+This is how most pipelines start, and it breaks in four ways.
+
+<AccordionGroup>
+  <Accordion title="It misses deletes" icon="trash">
+    A deleted row does not appear in any query. Your warehouse keeps a claim the source system no longer has, forever, and no amount of re-running fixes it.
+  </Accordion>
+  <Accordion title="It misses intermediate states" icon="forward-fast">
+    A claim that went `OPEN` to `IN_REVIEW` to `SETTLED` between two runs arrives as `SETTLED`. The middle state never existed as far as your warehouse is concerned — and reserving analysis depends on exactly those transitions.
+  </Accordion>
+  <Accordion title="It loads the source system" icon="gauge-high">
+    A large scan every few minutes competes with the application that people are actually using. Databases teams push back on this, correctly.
+  </Accordion>
+  <Accordion title="It depends on a column being honest" icon="triangle-exclamation">
+    `updated_at` only works if every write path sets it. One bulk script that forgets, and rows go missing silently.
+  </Accordion>
+</AccordionGroup>
+
+## What CDC does instead
+
+Every database already keeps a log of every change it makes — it has to, in order to recover from a crash. **Change Data Capture reads that log** rather than querying tables.
+
+<Columns cols={2}>
+  <Card title="Query-based" icon="magnifying-glass">
+    Asks the database *what does this look like now?*
+
+    Sees final state. Misses deletes and intermediate values. Costs the source system real work.
+  </Card>
+  <Card title="Log-based CDC" icon="scroll">
+    Reads the database's own record of *what changed, in order*.
+
+    Sees every insert, update and delete including the value before the change. Near-zero load on the source.
+  </Card>
+</Columns>
+
+## What an event looks like
+
+Every change becomes a message with the same shape:
+
+```json
+{
+  "before": { "claim_id": 4471, "status": "IN_REVIEW", "adjuster_id": 12 },
+  "after":  { "claim_id": 4471, "status": "SETTLED",   "adjuster_id": 12 },
+  "op": "u",
+  "ts_ms": 1789412340000,
+  "source": { "db": "claims", "table": "claim", "lsn": 24587112 }
+}
+```
+
+<ParamField path="before" type="object">
+The row as it existed before the change. `null` for inserts.
+</ParamField>
+
+<ParamField path="after" type="object">
+The row as it exists after the change. `null` for deletes.
+</ParamField>
+
+<ParamField path="op" type="string">
+What happened: `c` create, `u` update, `d` delete, `r` read (a row captured during the initial snapshot rather than from live changes).
+</ParamField>
+
+<ParamField path="ts_ms" type="number">
+When the change was committed in the source database.
+</ParamField>
+
+<ParamField path="source" type="object">
+Where it came from, including the log position (`lsn`) — this is what makes replay and recovery possible.
+</ParamField>
+
+<Note>
+Having `before` and `after` in the same message is what makes CDC valuable for insurance. "The reserve on claim 4471 moved from ₹50,000 to ₹75,000 at 14:32" is one message. With query-based loading you would see only ₹75,000 and would have to infer the rest.
+</Note>
+
+## Where Debezium fits
+
+Postgres can produce a change stream, but it speaks its own protocol and will only talk to one consumer at a time. **Debezium** is the piece that connects to that stream, translates it into the JSON envelope above, and publishes it to Kafka — one topic per table.
+
+It also handles the part that is easy to underestimate: when it starts for the first time, the database already contains history. Debezium takes a consistent snapshot of existing rows (emitted with `op: "r"`), then switches to streaming live changes — without gaps and without duplicates at the boundary.
+
+<Warning>
+Debezium guarantees **at-least-once** delivery. After a crash it may re-send messages it already sent. Everything downstream must therefore be idempotent — which is why the warehouse uses `MERGE` on a business key rather than blind inserts.
+</Warning>
+
+## Why Kafka is in the middle
+
+Debezium could in principle write straight to a destination. Kafka sits in between for three reasons:
+
+<CardGroup cols={3}>
+  <Card title="Buffer" icon="battery-half">
+    If Snowflake is unavailable for an hour, events accumulate in Kafka instead of being lost.
+  </Card>
+  <Card title="Fan-out" icon="share-nodes">
+    The same stream feeds the warehouse, the live operations view, and anything added later — read independently, at their own pace.
+  </Card>
+  <Card title="Replay" icon="clock-rotate-left">
+    Events are retained after being read. A consumer with a bug can be fixed and re-run from any earlier position.
+  </Card>
+</CardGroup>

@@ -1,0 +1,111 @@
+---
+title: "Troubleshooting"
+description: "Errors actually hit during this build, and what caused them."
+icon: "wrench"
+---
+
+<AccordionGroup>
+  <Accordion title="docker: error during connect ... dockerDesktopLinuxEngine" icon="docker">
+    **Cause:** the Docker daemon is not running. The `docker` command exists, but there is no engine behind it.
+
+    **Fix:** start Docker Desktop and wait until the whale icon stops animating. Confirm with:
+
+    ```powershell
+    docker version
+    ```
+
+    Both a **Client** and a **Server** section must appear. Client-only means the engine is still down.
+  </Accordion>
+
+  <Accordion title="pgAdmin: failed to resolve host 'claims'" icon="plug-circle-xmark">
+    **Cause:** the database name was typed into the **Host** field.
+
+    **Fix:** Host is `localhost`. The database name belongs in the **Maintenance database** field.
+  </Accordion>
+
+  <Accordion title="pgAdmin: password authentication failed ... port 5432" icon="key">
+    **Cause:** the port was left at the default 5432. Neither container is on 5432.
+
+    **Fix:**
+
+    | Database | Host | Port |
+    | --- | --- | --- |
+    | `policy_admin` | localhost | 5433 |
+    | `claims` | localhost | 5434 |
+
+    Username and password are both `postgres`.
+  </Accordion>
+
+  <Accordion title="psql swallowed half my pasted block" icon="terminal">
+    **Cause:** pasting multiple statements into `psql` at once. A meta-command such as `\dt` consumes the rest of the line, and the remaining statements vanish without an error.
+
+    **Fix:** run statements one at a time, or use a GUI client. This is why pgAdmin is worth having.
+  </Accordion>
+
+  <Accordion title="syntax error at or near 'docker'" icon="triangle-exclamation">
+    **Cause:** a shell command was typed inside an open `psql` session.
+
+    **Fix:** `\q` to leave `psql` first. The prompt tells you where you are — `postgres=#` is inside the database, `PS D:\...>` is the shell.
+  </Accordion>
+
+  <Accordion title="pip.exe blocked by an Application Control policy" icon="ban">
+    **Cause:** a machine policy blocks the `pip.exe` launcher specifically.
+
+    **Fix:** call pip through the interpreter instead, which is not blocked:
+
+    ```powershell
+    python -m pip install psycopg2-binary faker
+    ```
+  </Accordion>
+
+  <Accordion title="An old replication slot is still there" icon="bookmark">
+    **Cause:** a slot created for manual testing was never dropped. This is the dangerous one — an inactive slot pins WAL indefinitely and will eventually fill the disk and stop the database accepting writes.
+
+    **Check what it is holding:**
+
+    ```sql
+    SELECT slot_name, active,
+           pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS wal_retained
+    FROM pg_replication_slots;
+    ```
+
+    **Drop it:**
+
+    ```sql
+    SELECT pg_drop_replication_slot('manual_peek');
+    ```
+
+    From the host shell instead:
+
+    ```powershell
+    docker compose exec postgres_policy psql -U postgres -d policy_admin -c "SELECT pg_drop_replication_slot('manual_peek');"
+    ```
+  </Accordion>
+
+  <Accordion title="Edits to the SQL files had no effect" icon="rotate">
+    **Cause:** scripts in `/docker-entrypoint-initdb.d` run **only** when the data directory is created. The named volume survives `docker compose down`, so the scripts never run again.
+
+    **Fix — destroys all data:**
+
+    ```powershell
+    docker compose down -v
+    docker compose up -d
+    python generator\seed.py
+    ```
+
+    The `-v` is what removes the volumes. Without it, nothing changes.
+  </Accordion>
+
+  <Accordion title="SHOW wal_level returns 'replica'" icon="database">
+    **Cause:** the `command:` block is missing, malformed, or the container was not recreated after the file was edited.
+
+    **Fix:** confirm the YAML parses, then force a recreate:
+
+    ```powershell
+    docker compose config
+    docker compose up -d --force-recreate postgres_policy
+    ```
+
+    `wal_level` needs a server restart — reloading configuration is not enough.
+  </Accordion>
+</AccordionGroup>

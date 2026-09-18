@@ -1,0 +1,73 @@
+---
+title: "Replica Identity"
+description: "Deciding how much of the old row Postgres writes down — and what it costs."
+icon: "clone"
+---
+
+## What it controls
+
+When a row is updated or deleted, Postgres has a choice about how much of the **old** version to record in the WAL. `REPLICA IDENTITY` is that choice.
+
+<Columns cols={2}>
+  <Card title="DEFAULT" icon="key">
+    Logs only the primary key.
+
+    A delete reads as: *"row 57 is gone."*
+  </Card>
+  <Card title="FULL" icon="table-list">
+    Logs the entire old row.
+
+    A delete reads as: *"row 57, which was OPEN with a ₹50,000 reserve assigned to adjuster 12, is gone."*
+  </Card>
+</Columns>
+
+In CDC terms: `FULL` is what populates the `before` object in the event envelope. With `DEFAULT`, `before` contains the key and nothing else.
+
+## The trade-off
+
+`FULL` is not free. Every update writes the complete old row into the WAL — more disk, more I/O, larger Kafka messages, more network. On a wide, frequently-updated table this is a real cost.
+
+So it is spent selectively: **`FULL` on tables that mutate and whose changes have meaning, `DEFAULT` on append-only tables.**
+
+## How each table was set
+
+<Tabs>
+  <Tab title="claims">
+    ```sql sql/claims/02_cdc.sql
+    ALTER TABLE claim                REPLICA IDENTITY FULL;
+    ALTER TABLE adjuster             REPLICA IDENTITY FULL;
+    ALTER TABLE claim_status_history REPLICA IDENTITY DEFAULT;
+    ALTER TABLE claim_transaction    REPLICA IDENTITY DEFAULT;
+    ```
+
+    | Table | Setting | Reasoning |
+    | --- | --- | --- |
+    | `claim` | FULL | Mutates constantly — status transitions, adjuster reassignment. The before-image is the whole point. |
+    | `adjuster` | FULL | Team and region get edited; you need to know what they were. |
+    | `claim_status_history` | DEFAULT | Append-only ledger. Rows are never updated, so a before-image would be dead weight on every message. |
+    | `claim_transaction` | DEFAULT | Same — reserves, payments and recoveries are only ever inserted. |
+  </Tab>
+  <Tab title="policy_admin">
+    ```sql sql/policy_admin/02_cdc.sql
+    ALTER TABLE policyholder    REPLICA IDENTITY FULL;
+    ALTER TABLE policy          REPLICA IDENTITY FULL;
+    ALTER TABLE policy_coverage REPLICA IDENTITY FULL;
+    ALTER TABLE endorsement     REPLICA IDENTITY DEFAULT;
+    ```
+
+    | Table | Setting | Reasoning |
+    | --- | --- | --- |
+    | `policyholder` | FULL | Addresses and contact details change; an address change is itself a reportable event. |
+    | `policy` | FULL | Status and premium change mid-term. |
+    | `policy_coverage` | FULL | Sum insured and deductible get revised. |
+    | `endorsement` | DEFAULT | Append-only record of changes — it already *is* a history table. |
+  </Tab>
+</Tabs>
+
+<Note>
+Notice the pattern: the append-only tables are exactly the ones with no `updated_at` column and no update trigger. The schema design and the CDC configuration agree with each other, because they are both expressing the same fact — *these rows never change*.
+</Note>
+
+<Tip>
+**Interview framing.** "We set `REPLICA IDENTITY FULL` only on mutating tables, because the before-image is what lets us compute what actually changed, and left append-only ledgers on `DEFAULT` to avoid paying WAL and network cost for information that would always be redundant." That sentence demonstrates you understand the mechanism *and* its cost.
+</Tip>

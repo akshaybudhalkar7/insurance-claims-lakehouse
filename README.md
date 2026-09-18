@@ -1,55 +1,32 @@
-# Mintlify Starter Kit
+# Insurance Claims Lakehouse — Documentation
 
-Use the starter kit to get your docs deployed and ready to customize.
+Documentation for an insurance claims and policy analytics platform built on
+Postgres CDC → Debezium → Kafka → S3 → Snowflake → dbt, orchestrated with Airflow.
 
-Click the green **Use this template** button at the top of this repo to copy the Mintlify starter kit. The starter kit contains examples with
+Published with [Mintlify](https://mintlify.com).
 
-- Guide pages
-- Navigation
-- Customizations
-- API reference pages
-- Use of popular components
+## What the platform does
 
-**[Follow the full quickstart guide](https://starter.mintlify.com/quickstart)**
+Insurers need loss-ratio, reserving and claims-operations reporting that is
+**point-in-time accurate** — an auditor can ask what the reserve figure was on a
+past date, and the answer has to be reproducible. That single requirement is what
+drives every architectural decision here: change data capture rather than nightly
+snapshots, an append-only raw layer, and idempotent incremental loads.
 
-## AI-assisted writing
+## Contents
 
-Set up your AI coding tool to work with Mintlify:
+| Section | Covers |
+| --- | --- |
+| Overview | The business problem, system architecture, ingestion paths |
+| Concepts | How CDC, WAL/replication slots and replica identity actually work |
+| Build Log | What was built at each stage, and the reasoning behind each decision |
+| Reference | Verification queries and a troubleshooting catalogue |
+
+## Local preview
 
 ```bash
-npx skills add https://mintlify.com/docs
-```
-
-This command installs Mintlify's documentation skill for your configured AI tools like Claude Code, Cursor, Windsurf, and others. The skill includes component reference, writing standards, and workflow guidance.
-
-See the [AI tools guides](/ai-tools) for tool-specific setup.
-
-## Development
-
-Install the [Mintlify CLI](https://www.npmjs.com/package/mint) to preview your documentation changes locally. To install, use the following command:
-
-```
 npm i -g mint
-```
-
-Run the following command at the root of your documentation, where your `docs.json` is located:
-
-```
 mint dev
 ```
 
-View your local preview at `http://localhost:3000`.
-
-## Publishing changes
-
-Install our GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app) to propagate changes from your repo to your deployment. Changes are deployed to production automatically after pushing to the default branch.
-
-## Need help?
-
-### Troubleshooting
-
-- If your dev environment isn't running: Run `mint update` to ensure you have the most recent version of the CLI.
-- If a page loads as a 404: Make sure you are running in a folder with a valid `docs.json`.
-
-### Resources
-- [Mintlify documentation](https://mintlify.com/docs)
+Opens at http://localhost:3000.

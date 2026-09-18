@@ -1,0 +1,83 @@
+---
+title: "2. The Schemas"
+description: "Eight tables across two systems, and the design decisions inside them."
+icon: "table"
+---
+
+## policy_admin
+
+Four tables describing what was sold.
+
+| Table | Holds | Notes |
+| --- | --- | --- |
+| `policyholder` | Customers | Name, contact, address |
+| `policy` | Policies sold | `policy_number` is the business key, unique |
+| `policy_coverage` | What each policy covers | Sum insured, deductible, premium allocation |
+| `endorsement` | Mid-term changes | Old value / new value pairs — already a history table |
+
+Products are `MOTOR`, `HOME` or `TRAVEL`; policy status is `ACTIVE`, `LAPSED` or `CANCELLED`.
+
+## claims
+
+Four tables describing what went wrong.
+
+| Table | Holds | Notes |
+| --- | --- | --- |
+| `adjuster` | Staff handling claims | Team and region |
+| `claim` | The claim itself | Status, cause, catastrophe code, JSONB notes |
+| `claim_status_history` | Every status transition | Append-only |
+| `claim_transaction` | The money | Append-only ledger |
+
+Claim status moves through `OPEN`, `ASSIGNED`, `IN_REVIEW`, `SETTLED`, `CLOSED` or `REJECTED`.
+
+## Three decisions worth understanding
+
+<AccordionGroup>
+  <Accordion title="claim.policy_number has no foreign key" icon="link-slash">
+    ```sql sql/claims/01_schema.sql
+    policy_number VARCHAR(30) NOT NULL,   -- deliberately NO foreign key
+    ...
+    CREATE INDEX idx_claim_policy_number ON claim(policy_number);
+    ```
+
+    There is an index for lookup speed, but no constraint — because the policy lives in a **different database**, and a foreign key cannot cross that boundary.
+
+    The consequence is that some claims reference policies that do not exist. Around 2% of the seeded data does this on purpose. Real insurers have exactly this problem, caused by typos, timing, and migrations. The pipeline must detect and quarantine these rather than silently dropping them.
+  </Accordion>
+
+  <Accordion title="The money is a ledger, not a column" icon="money-bill-transfer">
+    There is no `total_paid` column on `claim`. Instead, `claim_transaction` records every movement:
+
+    | `txn_type` | Meaning |
+    | --- | --- |
+    | `RESERVE` | Money set aside for a claim not yet paid |
+    | `PAYMENT` | Money actually paid out |
+    | `RECOVERY` | Money recovered afterwards — stored as a negative amount |
+
+    with `txn_category` splitting `INDEMNITY` (the loss itself) from `EXPENSE` (lawyers, assessors).
+
+    This matters because **incurred = paid + outstanding reserve**, and reserves get revised repeatedly as a claim develops. A single running-total column could never reproduce the figure as at a past date. A ledger can.
+  </Accordion>
+
+  <Accordion title="Only mutating tables get an updated_at trigger" icon="clock">
+    ```sql sql/claims/01_schema.sql
+    CREATE OR REPLACE FUNCTION set_updated_at() RETURNS trigger AS $$
+    BEGIN
+        NEW.updated_at = now();
+        RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+
+    CREATE TRIGGER trg_claim_upd BEFORE UPDATE ON claim
+        FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+    ```
+
+    The function does one thing: before any update, stamp `updated_at` with the current time. It is attached to `claim` and `adjuster` only.
+
+    `claim_status_history` and `claim_transaction` have no `updated_at` column and no trigger, because nothing ever updates them. The same fact drives their `REPLICA IDENTITY` setting — see [Replica Identity](/concepts/replica-identity).
+  </Accordion>
+</AccordionGroup>
+
+<Note>
+`claim.notes` is a `JSONB` column. It is there so the pipeline has to handle semi-structured data landing in Snowflake's `VARIANT` type, which is how real claim systems store free-form adjuster notes and attachments metadata.
+</Note>
