@@ -38,7 +38,8 @@
           "setup/01-databases",
           "setup/02-schemas",
           "setup/03-cdc-enablement",
-          "setup/04-seed-data"
+          "setup/04-seed-data",
+          "setup/05-kafka-and-debezium"
         ]
       },
       {

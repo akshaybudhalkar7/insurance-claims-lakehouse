@@ -1,0 +1,259 @@
+---
+title: "5. Kafka and Debezium"
+description: "Standing up the broker, Kafka Connect, and the two CDC connectors that make capture live."
+icon: "tower-broadcast"
+---
+
+This is the stage where capture actually starts. Everything before it was preparation.
+
+## What was added
+
+Three services joined `Infra/docker-compose.yml`:
+
+| Service | Image | Purpose |
+| --- | --- | --- |
+| `kafka` | `apache/kafka:3.8.0` | single broker in KRaft mode — no ZooKeeper |
+| `connect` | `quay.io/debezium/connect:2.7` | runs the Debezium connectors |
+| `kafka_ui` | `provectuslabs/kafka-ui` | browser UI on port 8085 |
+
+<Note>
+**Why one Compose file for databases and Kafka.** They must share a Docker network so Connect can resolve `postgres_policy:5432` and `kafka:9092` by service name, and `depends_on: condition: service_healthy` only works within a single Compose project. It is a local convenience — in production these are RDS, MSK and Fargate, with three different lifecycles, deployed by CDK.
+</Note>
+
+## The listener configuration
+
+The single most misconfigured part of Kafka in Docker, and worth understanding properly.
+
+```yaml
+KAFKA_LISTENERS:            PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,HOST://0.0.0.0:29092
+KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,HOST://localhost:29092
+```
+
+**A listener is a door. An advertised listener is the address written on the invitation.**
+
+`LISTENERS` are the sockets the broker opens. `ADVERTISED_LISTENERS` is what the broker *tells clients to reconnect to* — a client bootstraps once, receives the cluster's advertised addresses, and reconnects to those.
+
+Hence two doors for one broker:
+
+<Columns cols={2}>
+  <Card title="PLAINTEXT — kafka:9092" icon="network-wired">
+    For containers on `claims_net`: Connect and Kafka UI resolve the service name.
+  </Card>
+  <Card title="HOST — localhost:29092" icon="laptop">
+    For Python on the Windows side, which cannot resolve `kafka`. Requires publishing port 29092.
+  </Card>
+</Columns>
+
+<Warning>
+Advertise only `localhost:9092` and Connect's bootstrap succeeds, then everything after it fails — because inside its own container, "localhost" means Connect itself. The symptom is a connector that registers cleanly and never produces a message.
+</Warning>
+
+## Single-broker concessions
+
+```yaml
+KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+```
+
+Kafka's internal topics default to replication factor 3 and the broker refuses to start when that is impossible. These force 1.
+
+**All three are wrong for production.** Replication factor 1 on `__consumer_offsets` means a broker failure loses every consumer group's position. On MSK you leave the defaults alone.
+
+## Named volumes
+
+Kafka initially had no volume at all, which meant its log directory lived in the container's writable layer — every `docker compose down` would have silently destroyed all topics, offsets and Connect state.
+
+Each path an image declares as a `VOLUME` gets an anonymous volume with a random hex name unless you claim it. Those accumulate on every up/down cycle. All six are now named:
+
+```yaml
+kafka:
+  volumes:
+    - kafka_data:/var/lib/kafka/data
+    - kafka_secrets:/etc/kafka/secrets
+    - kafka_shared_config:/mnt/shared/config
+connect:
+  volumes:
+    - connect_data:/kafka/data
+    - connect_logs:/kafka/logs
+    - connect_config:/kafka/config
+```
+
+A `name: claims-platform` key was also added at the top of the file. Without it Compose names the project after its folder — `Infra` — and prefixes every volume and network with `infra_`.
+
+## The connectors
+
+Two JSON files in `connectors/`, one per source database, POSTed to Connect's REST API:
+
+```powershell
+curl.exe -X POST -H "Content-Type: application/json" --data "@connectors/policy-admin.json" http://localhost:8083/connectors
+curl.exe -X POST -H "Content-Type: application/json" --data "@connectors/claims.json" http://localhost:8083/connectors
+```
+
+<Note>
+The configuration goes to **Kafka Connect**, not to Kafka. Kafka only stores messages; it has no idea how to talk to Postgres. Connect runs the Debezium task, which pulls from the database and pushes into topics — then saves the config into the `connect_configs` topic so it survives a restart.
+</Note>
+
+### The properties that matter
+
+<AccordionGroup>
+  <Accordion title="database.hostname — the container name, not localhost" icon="server">
+    ```json
+    "database.hostname": "postgres_policy",
+    "database.port": "5432"
+    ```
+    Connect sits inside the Docker network, so it uses the service name and the *internal* port 5432 — not the published 5433.
+  </Accordion>
+
+  <Accordion title="publication.autocreate.mode — disabled on purpose" icon="list-check">
+    ```json
+    "publication.name": "dbz_policy_admin",
+    "publication.autocreate.mode": "disabled"
+    ```
+    Left on its default, Debezium tries to create the publication, which requires ownership the `dbz` role does not have. Since `02_cdc.sql` already created it, autocreate is disabled. A common first-run failure.
+  </Accordion>
+
+  <Accordion title="slot.name — where capture actually begins" icon="bookmark">
+    ```json
+    "slot.name": "dbz_policy_admin_slot"
+    ```
+    The slot is never created by any SQL file. **Debezium creates it when the connector starts.** Three things enable that: `max_replication_slots=4` in Compose allows it, the `REPLICATION` attribute on the `dbz` role permits it, and this property names it.
+
+    Before registering the connectors, `pg_replication_slots` returned zero rows. Afterwards it returns two. That is the moment WAL retention began.
+  </Accordion>
+
+  <Accordion title="heartbeat.interval.ms — the disk-fill guard" icon="heart-pulse">
+    ```json
+    "heartbeat.interval.ms": "10000"
+    ```
+    On a quiet database Debezium has nothing to emit, so it never acknowledges a new WAL position, so the slot never advances — and WAL accumulates while nothing is happening. Heartbeats force periodic acknowledgement.
+  </Accordion>
+
+  <Accordion title="decimal.handling.mode — or every amount is garbage" icon="money-bill">
+    ```json
+    "decimal.handling.mode": "string"
+    ```
+    Without it, `NUMERIC(14,2)` arrives base64-encoded and every reserve and payment looks like noise. With it, `"amount": "75000.00"`.
+  </Accordion>
+
+  <Accordion title="snapshot.mode — history first, then streaming" icon="camera">
+    ```json
+    "snapshot.mode": "initial"
+    ```
+    Read all existing rows as `op: "r"`, then switch to live changes. The seeded rows flowed through this path, which is why `seed.py` must run *before* the connectors are registered.
+  </Accordion>
+</AccordionGroup>
+
+## What a real event looks like
+
+The first message read from `claims.public.claim`:
+
+```json
+Key: {"claim_id":2}
+
+{
+  "before": null,
+  "after": {
+    "claim_id": 2,
+    "claim_ref": "FNOL-2024-0000002",
+    "policy_number": "POL-2023-002591",
+    "status": "CLOSED",
+    "loss_date": 19885,
+    "notes": "{\"channel\": \"BRANCH\", \"severity_hint\": \"HIGH\"}",
+    "created_at": "2026-09-19T04:28:30.506342Z"
+  },
+  "source": { "db": "claims", "table": "claim", "lsn": 71443088, "snapshot": "true" },
+  "op": "r"
+}
+```
+
+### Three type conventions to handle downstream
+
+<Warning>
+**`loss_date: 19885`** — `DATE` is encoded as **days since 1970-01-01**. That is 10 June 2024. Treat it as a number and every date in the marts is wrong.
+
+**`notes`** — the `JSONB` column arrives as an **escaped string**, not nested JSON. Snowflake needs `PARSE_JSON()`.
+
+**`created_at`** — `TIMESTAMPTZ` arrives as a proper **ISO string**. So dates and timestamps use different conventions in the same message.
+</Warning>
+
+The inconsistency comes from `schemas.enable: false`, which strips the schema that would have declared `loss_date` as `io.debezium.time.Date`. Smaller messages, but consumers must know the conventions. Production would use Avro with Schema Registry so types carry their meaning.
+
+## Seeing it work
+
+Open http://localhost:8085 → **Topics** → `claims.public.claim` → **Messages**, set Seek Direction to **Live Mode**, then run SQL against `claims` and watch events arrive.
+
+<Steps>
+  <Step title="Update — op u">
+    ```sql
+    UPDATE claim SET status = 'IN_REVIEW' WHERE claim_id = 5;
+    ```
+    `before.status` and `after.status` both populated. That before-image is what `REPLICA IDENTITY FULL` pays for.
+  </Step>
+  <Step title="Insert — op c">
+    ```sql
+    INSERT INTO claim (claim_ref, policy_number, loss_date, report_date, status, cause_code)
+    VALUES ('FNOL-TEST-0001', 'POL-2023-002591', CURRENT_DATE, CURRENT_DATE, 'OPEN', 'FIRE');
+    ```
+    `before` is null.
+  </Step>
+  <Step title="Delete — op d, plus a tombstone">
+    ```sql
+    DELETE FROM claim WHERE claim_ref = 'FNOL-TEST-0001';
+    ```
+    **Two** messages: the delete with a full `before` and `after: null`, then a second with the same key and a null value. That second is a *tombstone*, telling compacted topics and downstream systems the key is gone for good. It appears because `tombstones.on.delete` is true.
+  </Step>
+  <Step title="The replica identity comparison">
+    Switch to `claims.public.claim_transaction`, which is `REPLICA IDENTITY DEFAULT`:
+
+    ```sql
+    INSERT INTO claim_transaction (claim_id, txn_type, txn_category, amount, txn_date)
+    VALUES (5, 'RESERVE', 'INDEMNITY', 75000.00, CURRENT_DATE);
+
+    DELETE FROM claim_transaction WHERE claim_id = 5 AND amount = 75000.00;
+    ```
+
+    On the delete, `before` contains **only `txn_id`** — no amount, no type. Same connector, same cluster, different table. `DEFAULT` versus `FULL`, visible side by side.
+  </Step>
+</Steps>
+
+## Where the data flows — and does not
+
+```
+Postgres   writes WAL (always has)
+Debezium   PULLS from the replication slot, PUSHES into Kafka topics
+Kafka      stores. Nothing else.
+consumers  PULL from Kafka
+```
+
+<Note>
+**Kafka never listens.** It is passive storage that holds what something hands it. Nothing subscribes, nothing is notified. When events stop arriving, the question is always *which component stopped pulling* — never *did Kafka miss it*.
+</Note>
+
+Nothing reads from these topics yet. The events sit in Kafka with no consumer; the S3 sink, Snowpipe and Snowflake are the rest of the October milestone.
+
+## Verify
+
+```powershell
+curl.exe http://localhost:8083/connectors
+curl.exe http://localhost:8083/connectors/claims-connector/status
+docker compose exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list
+```
+
+```sql
+SELECT slot_name, plugin, active FROM pg_replication_slots;
+```
+
+<Check>
+Both connectors `RUNNING`; eight table topics plus two heartbeat topics; two slots, plugin `pgoutput`, `active = true`.
+</Check>
+
+<Warning>
+**Deleting a connector does not delete its slot.** Debezium leaves it deliberately so the connector can be recreated and resume. An abandoned slot pins WAL forever:
+
+```sql
+SELECT pg_drop_replication_slot('dbz_claims_slot');
+```
+
+Do not set `slot.drop.on.stop: true` in production — stopping for a deploy would discard the position and force a full re-snapshot.
+</Warning>

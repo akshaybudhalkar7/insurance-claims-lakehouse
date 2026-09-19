@@ -86,7 +86,7 @@ VOLUMES = {
     Faker.seed(42)
     ```
 
-    Fixed seeds mean the same data every run, so results can be compared across rebuilds. `Faker("en_IN")` produces Indian names, cities and phone formats, which suits the scenario.
+    Fixed seeds mean the same *shape* of data every run. Exact counts still drift slightly between runs, because `TODAY = date.today()` is read from the clock — dates are generated relative to today, so a different run date yields a different number of transactions per claim. Seeded randomness only gives full reproducibility when nothing else in the code reads the clock. `Faker("en_IN")` produces Indian names, cities and phone formats, which suits the scenario.
   </Accordion>
 </AccordionGroup>
 
