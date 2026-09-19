@@ -12,41 +12,9 @@
   "navigation": {
     "pages": [
       {
-        "group": "Overview",
+        "group": "Story",
         "pages": [
-          "index",
-          "architecture"
-        ]
-      },
-      {
-        "group": "Concepts",
-        "pages": [
-          "concepts/change-data-capture",
-          "concepts/wal-and-slots",
-          "concepts/replica-identity"
-        ]
-      },
-      {
-        "group": "Learning",
-        "pages": [
-          "learning/kafka-fundamentals"
-        ]
-      },
-      {
-        "group": "Build Log",
-        "pages": [
-          "setup/01-databases",
-          "setup/02-schemas",
-          "setup/03-cdc-enablement",
-          "setup/04-seed-data",
-          "setup/05-kafka-and-debezium"
-        ]
-      },
-      {
-        "group": "Reference",
-        "pages": [
-          "reference/verification",
-          "reference/troubleshooting"
+          "index"
         ]
       }
     ]

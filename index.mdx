@@ -1,84 +1,348 @@
 ---
-title: "Introduction"
-description: "What this platform does, and why it is built the way it is."
+title: "Postgres to Kafka CDC, from nothing"
+description: "The whole story — what we built, in what order, and why each piece exists."
 icon: "book-open"
 ---
 
-## The business problem
+Starting from an empty folder, this is how every insert, update and delete in two Postgres databases ends up as a stream of events in Kafka — and why each piece is there.
 
-An insurer needs to answer three questions every morning, from data that was correct **as of a specific moment**:
+## 0. The goal
 
-<CardGroup cols={3}>
-  <Card title="Loss ratio" icon="chart-line">
-    How much are we paying out compared to the premium we collected?
-  </Card>
-  <Card title="Reserving" icon="piggy-bank">
-    For claims still open, how much money must we set aside?
-  </Card>
-  <Card title="Claims operations" icon="headset">
-    What is happening right now — new claims, backlogs, one storm hitting many policies at once?
-  </Card>
-</CardGroup>
+- Get every insert, update and delete from two Postgres databases into Kafka, as a stream of events
+- Without querying the source databases, and without missing anything
 
-The awkward part is the phrase *as of a specific moment*. An auditor may ask what the reserve figure was on 31 March. If the reporting system only ever holds the latest values, that question cannot be answered. The history has to be captured as it happens.
+---
 
-That single requirement is what shapes the whole architecture.
+## 1. Why not just query the database
 
-## Why the data is hard to get
+The obvious approach is `SELECT * FROM claim WHERE updated_at > last_run`. It breaks four ways.
 
-The numbers live in two separate operational systems that were never designed to be read together:
-
-<CardGroup cols={2}>
-  <Card title="Policy administration" icon="file-contract">
-    Policyholders, policies, coverages, and endorsements (mid-term changes).
-  </Card>
-  <Card title="Claims" icon="folder-open">
-    Claims, adjusters, status history, and financial transactions.
-  </Card>
-</CardGroup>
-
-They are two different databases owned by two different teams. A claim stores a `policy_number` as plain text — there is no database-level link between the two systems, because a foreign key cannot span two databases. Some claims therefore reference policies that do not exist. That is not a bug in this project; it is a deliberate reproduction of something that happens in every real insurer, and the pipeline has to detect and quarantine it rather than pretend it away.
+- **Deletes vanish.** A deleted row appears in no query. Your copy keeps it forever.
+- **Middle states vanish.** A claim that went `OPEN → IN_REVIEW → SETTLED` between two runs arrives as `SETTLED`. The transitions never existed for you — and reserving analysis is *about* those transitions.
+- **It loads the source.** Big scans every few minutes compete with the live application.
+- **It trusts a column.** `updated_at` only works if every write path sets it. One bulk script forgets, rows go missing silently.
 
 <Note>
-**This project is a data platform, not a machine-learning project.** There is no model, no prediction, no GenAI layer. The goal is a correct, auditable, incrementally-loaded warehouse — which is what the job market actually pays for.
+So: read the database's own log instead of querying its tables. That is change data capture.
 </Note>
 
-## What "correct" means here
+---
 
-Three properties the pipeline must hold, which come up constantly in design discussions:
+## 2. What the database is already doing — the WAL
 
-<AccordionGroup>
-  <Accordion title="Point-in-time accuracy" icon="clock-rotate-left">
-    You must be able to reconstruct the state of any claim on any past date. This is why changes are captured as a stream of events rather than a nightly snapshot of current values — a snapshot taken at midnight silently loses every change that happened and was reversed during the day.
-  </Accordion>
-  <Accordion title="Idempotency" icon="rotate">
-    Running the same load twice must not double-count anything. Pipelines fail and get retried; if a retry inflates your paid-claims figure, the number is worthless.
-  </Accordion>
-  <Accordion title="Auditability" icon="magnifying-glass">
-    For any number in a report, you must be able to trace it back to the source row and the moment it changed. "The dashboard says 64%" is not an answer an auditor accepts.
-  </Accordion>
-</AccordionGroup>
+**WAL = Write-Ahead Log.** Literally: *write down what you are about to do, before you do it.*
 
-## Where the build currently stands
-
-<Steps>
-  <Step title="Source databases" icon="check">
-    Two Postgres instances running in Docker, configured for logical replication, with schemas created and change-capture enabled. **Done.**
-  </Step>
-  <Step title="Seed data" icon="check">
-    Around 160,000 rows of realistic insurance data — policies, claims, reserves, payments, recoveries, and one shared catastrophe event. **Done.**
-  </Step>
-  <Step title="Kafka and Debezium" icon="check">
-    Broker, Kafka Connect and UI running; two Debezium connectors registered, replication slots live, and every insert, update and delete arriving in Kafka topics within a second. **Done.**
-  </Step>
-  <Step title="S3 and Snowflake" icon="hourglass">
-    Land events as Parquet, ingest into a raw layer, then build current-state tables. **Next.**
-  </Step>
-  <Step title="dbt and orchestration" icon="hourglass">
-    Transform into analytics-ready marts with tests, scheduled by Airflow.
-  </Step>
-</Steps>
+- On an `UPDATE`, Postgres appends "row X changed from A to B" to a sequential log and flushes **that** to disk — *then* updates the real data files later, lazily
+- **Why:** crash safety. Power dies mid-write, replay the log on restart and repair. A commit means "WAL is on disk", not "table is updated"
+- Also speed: one sequential append beats scattered random writes
+- Every serious database has one — Oracle redo, SQL Server transaction log, MySQL binlog, **DB2's transaction log** (what AWS DMS reads)
 
 <Tip>
-If you are new to this repository, read [Architecture](/architecture) next for the shape of the system, then [Change Data Capture](/concepts/change-data-capture) for the single idea everything else depends on.
+**The key insight:** the WAL exists for crash recovery and replication. CDC is a *passenger* on it. That is why log-based CDC costs the source almost nothing — you are reading a byproduct, not running queries.
 </Tip>
+
+---
+
+## 3. Making the WAL readable — `wal_level=logical`
+
+- By default the WAL is written in **disk-block shorthand** — enough to repair files, useless for "which row changed to what"
+- `wal_level=logical` makes Postgres *also* record row-level changes
+- Set as a **startup flag**, not SQL, because it needs a server restart
+
+```yaml Infra/docker-compose.yml
+command: [postgres, -c, wal_level=logical, -c, max_replication_slots=4, ...]
+```
+
+- Verify with `SHOW wal_level;` — it must say `logical`
+
+---
+
+## 4. Three more things to configure in Postgres
+
+Three separate knobs that meet later, at read time.
+
+### a) Publication — WHICH tables
+
+```sql
+CREATE PUBLICATION dbz_claims
+  FOR TABLE claim, claim_status_history, claim_transaction, adjuster;
+```
+
+- A named guest list. A table not in it is invisible to CDC — no error, it just never produces events
+
+### b) Replica identity — HOW MUCH of the old row
+
+```sql
+ALTER TABLE claim             REPLICA IDENTITY FULL;
+ALTER TABLE claim_transaction REPLICA IDENTITY DEFAULT;
+```
+
+- `DEFAULT` → on update or delete, log **only the primary key**: *"row 57 is gone"*
+- `FULL` → log **the entire old row**: *"row 57, which was OPEN with a ₹50,000 reserve, is gone"*
+- `FULL` costs WAL volume, disk and network on every change — so spend it selectively
+- **Rule used here:** `FULL` on tables that mutate (`claim`, `adjuster`, `policy`), `DEFAULT` on append-only ledgers (`claim_transaction`, `claim_status_history`) where a before-image would always be redundant
+
+### c) A dedicated role — WHO may read
+
+```sql
+CREATE ROLE dbz WITH REPLICATION LOGIN PASSWORD 'dbz';
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO dbz;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO dbz;
+```
+
+- `REPLICATION` → allowed to open a replication slot. Without it, nothing works
+- `SELECT` → needed for the **initial snapshot** of existing rows
+- `ALTER DEFAULT PRIVILEGES` → future tables readable without re-granting
+- Never the superuser. Read and replicate only; it never writes
+
+---
+
+## 5. How those three connect
+
+```
+WAL  (every change, every table)
+ │
+ ├─ replication slot  → where am I reading from; keep WAL back to here
+ ├─ publication       → WHICH tables pass the filter
+ └─ replica identity  → HOW MUCH old-row data each table contributes
+ ↓
+stream to Debezium
+```
+
+- **Publication filters. Replica identity shapes. Slot tracks position.**
+- Order matters: the publication gates first. A table with `FULL` that is not in the publication emits nothing — its identity is never consulted
+- The slot is orthogonal: it does not care which tables are in the publication, only the WAL position. **Two connectors on one database need two slots**, because each has its own position
+
+---
+
+## 6. The replication slot — the piece you never create
+
+A slot is a **bookmark with teeth**: it stores a WAL position *and* forbids Postgres from deleting WAL past it. That is the guarantee nothing is lost while a consumer is offline.
+
+- `pg_replication_slots` is a **built-in Postgres view**, not something Debezium creates. It is always there, empty until a slot exists
+- **Nothing in any SQL file creates the slot.** Three things only *enable* it:
+
+| Where | What it does |
+| --- | --- |
+| `max_replication_slots=4` in Compose | capacity |
+| `REPLICATION` on the `dbz` role | permission |
+| `"slot.name": "dbz_claims_slot"` in the connector JSON | the name |
+
+- **Debezium creates it when the connector starts.** That is the exact moment recording begins
+- If a slot exists on restart, Debezium resumes from its position instead of re-snapshotting
+
+<Warning>
+**Deleting a connector does not delete its slot** — deliberately, so it can resume. But an abandoned slot pins WAL forever, until the disk fills and the database stops accepting writes.
+
+```sql
+SELECT pg_drop_replication_slot('dbz_claims_slot');
+```
+</Warning>
+
+---
+
+## 7. Why Kafka sits in the middle
+
+Debezium could write straight to a destination. Kafka is there for three reasons.
+
+<CardGroup cols={3}>
+  <Card title="Buffer" icon="battery-half">
+    Snowflake down for an hour? Events accumulate instead of being lost.
+  </Card>
+  <Card title="Fan-out" icon="share-nodes">
+    One stream feeds the warehouse, the live ops view, and anything added later — each at its own pace.
+  </Card>
+  <Card title="Replay" icon="clock-rotate-left">
+    Events are retained *after* being read, so a buggy consumer can be fixed and re-run from any earlier position.
+  </Card>
+</CardGroup>
+
+---
+
+## 8. Three layers, not one tool
+
+```
+Kafka              topics, partitions, offsets — passive storage
+ └─ Kafka Connect     a framework that runs connectors, REST API on 8083
+      └─ Debezium        a source connector plugin that reads the WAL
+```
+
+- **Debezium is not standalone.** It is a plugin inside Connect, which runs on top of Kafka
+- Learn it bottom-up and every config line has a reason; top-down and it is strings you copy
+
+The Kafka parts that matter here:
+
+- **Topic** — a named, append-only log. One per captured table: `claims.public.claim`
+- **Partition** — the topic split into N ordered logs. **Order is guaranteed only within a partition**
+- **Key → partition.** Debezium keys each event by the row's primary key, so every change to claim 4457 lands in the same partition, in order. A different claim may go elsewhere — fine, they are independent rows
+- **No key → round-robin → corruption.** Three updates to policy 7 could land in three partitions and be applied out of order
+
+---
+
+## 9. Standing it up — one Compose file
+
+Five containers, one file.
+
+| Service | Why |
+| --- | --- |
+| `postgres_policy`, `postgres_claims` | the two sources |
+| `kafka` | single broker, KRaft mode (no ZooKeeper) |
+| `connect` | runs the Debezium connectors |
+| `kafka_ui` | browser view on port 8085 |
+
+**Why one file, not several:**
+
+- They must share a Docker network so Connect can resolve `postgres_policy:5432` and `kafka:9092` **by service name**
+- `depends_on: condition: service_healthy` only works inside one Compose project — without it Connect boots before the broker is ready and dies
+- One `up`, one `down`
+
+<Note>
+**One file does not mean one container.** Each service is its own machine. Compose is the room, not the thing.
+
+**And in production these are not one unit at all** — RDS, MSK and Fargate: three lifecycles, three owners, deployed by CDK. The single file is a local convenience that deliberately does not mirror production.
+</Note>
+
+### The only Kafka settings worth knowing
+
+**Listeners — the one everyone gets wrong**
+
+```yaml
+KAFKA_LISTENERS:            PLAINTEXT://0.0.0.0:9092, ... ,HOST://0.0.0.0:29092
+KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,      HOST://localhost:29092
+```
+
+- **A listener is a door. An advertised listener is the address on the invitation.**
+- A client bootstraps once, gets told where to reconnect, then uses *that* address
+- Two doors, one broker: containers use `kafka:9092`; Python on Windows cannot resolve `kafka`, so it uses `localhost:29092`
+
+<Warning>
+Advertise only `localhost` and Connect bootstraps fine, then fails forever — inside its own container, "localhost" means Connect itself. The symptom is a connector that registers cleanly and never produces a message.
+</Warning>
+
+**Replication factor 1**
+
+```yaml
+KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+```
+
+- Kafka's internal topics default to 3, and the broker will not start with one node
+- **Wrong for production** — RF 1 on `__consumer_offsets` means a broker failure loses every consumer's position. On MSK, leave the defaults alone
+
+**Named volumes**
+
+- Kafka initially had **no volume** — its log directory lived in the container layer, so `docker compose down` would have silently destroyed all topics and offsets
+- Images declaring `VOLUME` get **anonymous** volumes with random hex names, and a fresh set on every up/down cycle. Naming all six stops the pile-up
+- `name: claims-platform` at the top of the file — otherwise Compose names the project after its folder (`Infra`) and prefixes everything `infra_`
+
+---
+
+## 10. Telling Connect what to do
+
+One JSON file per source database, POSTed to Connect's REST API:
+
+```powershell
+curl.exe -X POST -H "Content-Type: application/json" --data "@connectors/claims.json" http://localhost:8083/connectors
+```
+
+<Note>
+**It goes to Kafka Connect, not to Kafka.** Kafka only stores messages; it has no idea how to talk to Postgres. Connect starts a Debezium task and saves the config into the `connect_configs` topic so it survives a restart.
+</Note>
+
+The properties that carry consequences:
+
+| Property | Why it matters |
+| --- | --- |
+| `"database.hostname": "postgres_claims"` | container name and **internal** port 5432 — not `localhost:5434`. Connect is inside the network |
+| `"plugin.name": "pgoutput"` | Postgres's built-in decoder, the one `wal_level=logical` enables |
+| `"publication.autocreate.mode": "disabled"` | use the existing publication. Left on default, Debezium tries to create one and fails — `dbz` does not own it. Classic first-run error |
+| `"slot.name": "dbz_claims_slot"` | **the moment capture begins** |
+| `"heartbeat.interval.ms": 10000` | on a quiet database Debezium emits nothing, so the slot never advances and WAL grows while nothing happens. Heartbeats force acknowledgement |
+| `"decimal.handling.mode": "string"` | without it, `NUMERIC(14,2)` arrives base64-encoded and every amount is garbage |
+| `"snapshot.mode": "initial"` | read existing rows first as `op:"r"`, then stream. **This is why the seed script must run before registering connectors** |
+
+---
+
+## 11. What happens the instant you register
+
+<Steps>
+  <Step title="Connect authenticates">Debezium connects as `dbz`.</Step>
+  <Step title="The slot is created">WAL retention starts here.</Step>
+  <Step title="Snapshot">All existing rows are read and emitted as `op: "r"`.</Step>
+  <Step title="Switch to streaming">Resumes at the exact WAL position where the snapshot ended — no gap, no duplicate.</Step>
+  <Step title="Topics appear">One per table: `claims.public.claim`, `policy.public.policyholder`, and so on.</Step>
+</Steps>
+
+---
+
+## 12. What an event actually looks like
+
+```json
+Key:  {"claim_id": 2}
+
+{
+  "before": null,
+  "after":  { "claim_id": 2, "status": "CLOSED", "loss_date": 19885, ... },
+  "source": { "db": "claims", "table": "claim", "lsn": 71443088 },
+  "op": "r",
+  "ts_ms": 1789793347633
+}
+```
+
+- **Key** is the primary key — this is what pins all changes to one row into one partition
+- **op codes:** `c` create · `u` update · `d` delete · `r` read (snapshot)
+- **before and after in one message** is the whole value of CDC. *"The reserve moved from ₹50,000 to ₹75,000 at 14:32"* is a single event
+- A delete also produces a second **tombstone** message — same key, null value — telling compacted topics the key is gone for good
+
+<Warning>
+**Three type conventions to handle downstream:**
+
+- `loss_date: 19885` — `DATE` is **days since 1970-01-01** (= 10 June 2024). Treat it as a number and every date is wrong
+- `notes` — `JSONB` arrives as an **escaped string**, needs `PARSE_JSON()` in Snowflake
+- `created_at` — `TIMESTAMPTZ` arrives as a proper **ISO string**
+
+Different conventions in the same message, because `schemas.enable: false` strips the metadata that would have said `loss_date` is `io.debezium.time.Date`. Production would use Avro with Schema Registry so types carry their meaning.
+</Warning>
+
+---
+
+## 13. Direction of flow — nothing "listens"
+
+```
+Postgres    writes WAL (always has)
+Debezium    PULLS from the slot  →  PUSHES into Kafka topics
+Kafka       stores. That is all.
+consumers   PULL from Kafka
+```
+
+- **Kafka never listens, never subscribes, never gets notified.** It is passive storage
+- When events stop arriving, the question is always *which component stopped pulling* — never *did Kafka miss it*
+- Debezium guarantees **at-least-once** delivery. After a crash it may resend. Everything downstream must therefore be idempotent — which is why Snowflake will use `MERGE` on the primary key, not blind inserts
+
+---
+
+## 14. What is still empty
+
+- Nothing reads from these topics yet. Twelve thousand claim events sit there with **no consumer**
+- Next: S3 sink connector → Parquet → Snowpipe → RAW (VARIANT, append-only) → Streams and Tasks → STAGING → dbt marts
+
+---
+
+## The five sentences worth memorising
+
+<Steps>
+  <Step title="CDC reads the log the database was already writing">
+    Query-based loading misses deletes and intermediate states.
+  </Step>
+  <Step title="Publication filters which tables; replica identity shapes how much old row; the slot tracks position and holds WAL">
+    Three separate knobs that meet at read time.
+  </Step>
+  <Step title="Debezium creates the slot">
+    That is when capture starts — and an orphaned slot fills the disk.
+  </Step>
+  <Step title="Kafka preserves order only within a partition">
+    The producer picks the partition via the key.
+  </Step>
+  <Step title="Advertised listeners are the address clients are told to use">
+    Not the port the broker opens.
+  </Step>
+</Steps>
