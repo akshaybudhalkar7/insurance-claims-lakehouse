@@ -68,11 +68,11 @@ Three properties the pipeline must hold, which come up constantly in design disc
   <Step title="Seed data" icon="check">
     Around 160,000 rows of realistic insurance data — policies, claims, reserves, payments, recoveries, and one shared catastrophe event. **Done.**
   </Step>
-  <Step title="Kafka and Debezium" icon="hourglass">
-    Stream changes out of Postgres into Kafka topics. **Next.**
+  <Step title="Kafka and Debezium" icon="check">
+    Broker, Kafka Connect and UI running; two Debezium connectors registered, replication slots live, and every insert, update and delete arriving in Kafka topics within a second. **Done.**
   </Step>
   <Step title="S3 and Snowflake" icon="hourglass">
-    Land events as Parquet, ingest into a raw layer, then build current-state tables.
+    Land events as Parquet, ingest into a raw layer, then build current-state tables. **Next.**
   </Step>
   <Step title="dbt and orchestration" icon="hourglass">
     Transform into analytics-ready marts with tests, scheduled by Airflow.

@@ -59,12 +59,16 @@ Makes future tables readable automatically. Without it, every new table would ne
 Debezium is given a dedicated role with read and replication rights only — never the superuser account. It never writes to the source database. This separation is the first thing a security reviewer looks for.
 </Note>
 
-## What still has not happened
+## What this stage does not do
 
-At this point, capture is *possible* but not *running*. There is no replication slot.
+At the end of this stage, capture is *possible* but not yet *running* — there is no replication slot.
 
 ```sql
 SELECT slot_name, plugin, active FROM pg_replication_slots;
 ```
 
-This correctly returns **zero rows** right now. Debezium creates the slot when the connector is registered — that is the moment recording actually starts.
+Run immediately after the schema and CDC scripts, this returns **zero rows**. Publications and `wal_level` make capture possible; the slot is what makes it happen, and **Debezium creates the slot when a connector is registered**.
+
+<Note>
+Once the connectors are registered in [Kafka and Debezium](/setup/05-kafka-and-debezium), the same query returns one slot per database, plugin `pgoutput`, `active = true`. That is the moment WAL retention — and recording — begins.
+</Note>
